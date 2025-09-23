@@ -1,67 +1,87 @@
 import express from "express";
-import cors from "cors";
-import "dotenv/config";
 import OpenAI from "openai";
-import fs from "fs";
+import { ChromaClient } from "chromadb";
 
 const app = express();
-app.use(cors());
 app.use(express.json());
 
+// 🔑 Inicializa cliente de OpenAI
 const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-const botsConfig = JSON.parse(fs.readFileSync("./botsConfig.json", "utf-8"));
+// 🗂 Inicializa cliente de ChromaDB (persistente en disco de Render)
+const chroma = new ChromaClient({ path: "./memoria_db" });
+const collection = await chroma.getOrCreateCollection({ name: "memoria" });
 
-function sendSSE(res, data) {
-  res.write(`data: ${data}\n\n`);
+// 📌 Guardar recuerdos
+async function guardarMemoria(userId, texto) {
+  const embedding = await client.embeddings.create({
+    model: "text-embedding-3-small",
+    input: texto,
+  });
+
+  await collection.add({
+    ids: [`${userId}_${Date.now()}`], // id único
+    embeddings: [embedding.data[0].embedding],
+    documents: [texto],
+    metadatas: [{ userId }],
+  });
 }
 
-app.post("/chat-stream", async (req, res) => {
-  res.setHeader("Content-Type", "text/event-stream");
-  res.setHeader("Cache-Control", "no-cache");
-  res.setHeader("Connection", "keep-alive");
+// 📌 Recuperar recuerdos relevantes
+async function recuperarMemoria(userId, mensaje, topK = 5) {
+  const embedding = await client.embeddings.create({
+    model: "text-embedding-3-small",
+    input: mensaje,
+  });
 
-  const { botId, message } = req.body;
+  const resultados = await collection.query({
+    queryEmbeddings: [embedding.data[0].embedding],
+    nResults: topK,
+    where: { userId },
+  });
 
-  if (!message || !botId) {
-    sendSSE(res, "[ERROR] botId y message son obligatorios");
-    return res.end();
-  }
+  return resultados.documents?.[0] || [];
+}
 
-  const rolePrompt = botsConfig[botId.toLowerCase()];
-  if (!rolePrompt) {
-    sendSSE(res, "[ERROR] Bot no encontrado");
-    return res.end();
-  }
-
+// 📌 Endpoint principal de chat
+app.post("/chat", async (req, res) => {
   try {
-    const stream = await client.chat.completions.create({
-      model: "gpt-4o-mini",
-      messages: [
-        { role: "system", content: rolePrompt },
-        { role: "user", content: message }
-      ],
-      stream: true,
-    });
-
-    for await (const chunk of stream) {
-      const content = chunk.choices[0]?.delta?.content;
-      if (content) sendSSE(res, content);
+    const { userId, mensaje } = req.body;
+    if (!userId || !mensaje) {
+      return res.status(400).json({ error: "Falta userId o mensaje" });
     }
 
-    sendSSE(res, "[DONE]");
-    res.end();
+    // Recuperar recuerdos relevantes
+    const recuerdos = await recuperarMemoria(userId, mensaje);
+    const contexto = recuerdos.join("\n");
+
+    // Llamar al modelo con recuerdos
+    const completion = await client.chat.completions.create({
+      model: "gpt-4o-mini",
+      messages: [
+        {
+          role: "system",
+          content: "Eres un asistente con memoria persistente de cada usuario.",
+        },
+        { role: "system", content: `Recuerdos del usuario:\n${contexto}` },
+        { role: "user", content: mensaje },
+      ],
+    });
+
+    const respuesta = completion.choices[0].message.content;
+
+    // Guardar el mensaje como recuerdo nuevo
+    await guardarMemoria(userId, mensaje);
+
+    res.json({ respuesta });
   } catch (err) {
-    console.error("Error en /chat-stream:", err);
-    sendSSE(res, "[ERROR] Error en el servidor");
-    res.end();
+    console.error("Error en /chat:", err);
+    res.status(500).json({ error: "Error en el servidor" });
   }
 });
 
-app.get("/health", (req, res) => {
-  res.json({ status: "ok" });
-});
-
-app.listen(process.env.PORT, () => {
-  console.log(`Servidor corriendo en http://localhost:${process.env.PORT}`);
+// 🚀 Levantar servidor
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log(`Servidor corriendo en http://localhost:${PORT}`);
 });
