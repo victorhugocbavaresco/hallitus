@@ -1,49 +1,15 @@
 import express from "express";
 import OpenAI from "openai";
-import { ChromaClient } from "chromadb";
 
 const app = express();
 app.use(express.json());
 
-// 🔑 Inicializa cliente de OpenAI
 const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-// 🗂 Inicializa cliente de ChromaDB (persistente en disco de Render)
-const chroma = new ChromaClient({ path: "./memoria_db" });
-const collection = await chroma.getOrCreateCollection({ name: "memoria" });
+// Historial de conversación por usuario (en memoria)
+const conversationHistory = {}; // { userId: [ {role, content}, ... ] }
+const MAX_HISTORY = 10; // Limita el historial para no gastar demasiados tokens
 
-// 📌 Guardar recuerdos
-async function guardarMemoria(userId, texto) {
-  const embedding = await client.embeddings.create({
-    model: "text-embedding-3-small",
-    input: texto,
-  });
-
-  await collection.add({
-    ids: [`${userId}_${Date.now()}`], // id único
-    embeddings: [embedding.data[0].embedding],
-    documents: [texto],
-    metadatas: [{ userId }],
-  });
-}
-
-// 📌 Recuperar recuerdos relevantes
-async function recuperarMemoria(userId, mensaje, topK = 5) {
-  const embedding = await client.embeddings.create({
-    model: "text-embedding-3-small",
-    input: mensaje,
-  });
-
-  const resultados = await collection.query({
-    queryEmbeddings: [embedding.data[0].embedding],
-    nResults: topK,
-    where: { userId },
-  });
-
-  return resultados.documents?.[0] || [];
-}
-
-// 📌 Endpoint principal de chat
 app.post("/chat", async (req, res) => {
   try {
     const { userId, mensaje } = req.body;
@@ -51,28 +17,34 @@ app.post("/chat", async (req, res) => {
       return res.status(400).json({ error: "Falta userId o mensaje" });
     }
 
-    // Recuperar recuerdos relevantes
-    const recuerdos = await recuperarMemoria(userId, mensaje);
-    const contexto = recuerdos.join("\n");
+    // Inicializar historial si no existe
+    if (!conversationHistory[userId]) {
+      conversationHistory[userId] = [
+        { role: "system", content: "Eres un asistente amigable que mantiene el hilo de la conversación." }
+      ];
+    }
 
-    // Llamar al modelo con recuerdos
+    // Agregar mensaje del usuario
+    conversationHistory[userId].push({ role: "user", content: mensaje });
+
+    // Limitar historial
+    conversationHistory[userId] = conversationHistory[userId].slice(-MAX_HISTORY);
+
+    // Llamada a ChatGPT con todo el historial
     const completion = await client.chat.completions.create({
       model: "gpt-4o-mini",
-      messages: [
-        {
-          role: "system",
-          content: "Eres un asistente con memoria persistente de cada usuario.",
-        },
-        { role: "system", content: `Recuerdos del usuario:\n${contexto}` },
-        { role: "user", content: mensaje },
-      ],
+      messages: conversationHistory[userId]
     });
 
     const respuesta = completion.choices[0].message.content;
 
-    // Guardar el mensaje como recuerdo nuevo
-    await guardarMemoria(userId, mensaje);
+    // Agregar respuesta del bot al historial
+    conversationHistory[userId].push({ role: "assistant", content: respuesta });
 
+    // Limitar historial nuevamente
+    conversationHistory[userId] = conversationHistory[userId].slice(-MAX_HISTORY);
+
+    // Enviar respuesta al cliente
     res.json({ respuesta });
   } catch (err) {
     console.error("Error en /chat:", err);
@@ -80,7 +52,7 @@ app.post("/chat", async (req, res) => {
   }
 });
 
-// 🚀 Levantar servidor
+// Servidor
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`Servidor corriendo en http://localhost:${PORT}`);
